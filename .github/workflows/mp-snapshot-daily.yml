@@ -1,0 +1,38 @@
+# Mana Pool Snapshot → R2 — daily at 11pm EST
+# Runs mp-snapshot-r2.py to fetch catalog + sales and upload to Cloudflare R2.
+# Requires repo secrets: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY
+# Optional secret: R2_BUCKET (defaults to manapool-snapshots if unset)
+
+name: MP Snapshot to R2 (daily)
+
+on:
+  schedule:
+    # 11pm EST = 04:00 UTC (EST is UTC-5)
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+    # Allow manual trigger from Actions tab
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install boto3 requests python-dotenv
+
+      - name: Run Mana Pool snapshot
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: python mp-snapshot-r2.py
