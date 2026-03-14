@@ -12,7 +12,7 @@ Run daily via cron:
   0 6 * * * cd /path/to/dir && python3 mp_snapshot_r2.py
 
 Dependencies:
-  pip install boto3 requests
+  pip install boto3 requests python-dotenv pyarrow duckdb
 
 Env vars:
   R2_ACCOUNT_ID        - Cloudflare account ID
@@ -34,6 +34,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
+from mp_parquet import write_snapshot_parquet
+
 load_dotenv()
 
 # ---------------------------------------------------------------------------
@@ -54,6 +56,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("mp_snapshot")
 
+
+def log_workflow(message: str):
+    """Keep ingestion logs attributable when raw and Parquet writes interleave."""
+    log.info(f"mp-snapshot-r2.py: {message}")
+
 # ---------------------------------------------------------------------------
 # R2
 # ---------------------------------------------------------------------------
@@ -70,6 +77,7 @@ def get_r2_client():
 
 
 def upload_to_r2(client, bucket: str, key: str, data: bytes, content_type: str = "application/json"):
+    # Raw snapshot JSON remains the archive of record even after Parquet is introduced.
     compressed = gzip.compress(data)
     client.put_object(
         Bucket=bucket,
@@ -79,7 +87,9 @@ def upload_to_r2(client, bucket: str, key: str, data: bytes, content_type: str =
         ContentEncoding="gzip",
     )
     ratio = len(compressed) / len(data) * 100 if data else 0
-    log.info(f"Uploaded {key} — {len(data):,} → {len(compressed):,} bytes ({ratio:.0f}%)")
+    log_workflow(
+        f"Uploaded raw object {key} — {len(data):,} → {len(compressed):,} bytes ({ratio:.0f}%)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -156,16 +166,16 @@ def main():
     ts_str = snapshot_ts.strftime("%Y%m%dT%H%M%SZ")
     prefix = f"snapshots/{date_str}/{ts_str}"
 
-    log.info(f"Snapshot: {ts_str}")
-    log.info(f"R2 prefix: {prefix}")
-    log.info(f"Bucket: {args.bucket}")
-    log.info(f"Concurrency: {args.concurrency}")
+    log_workflow(f"Snapshot: {ts_str}")
+    log_workflow(f"R2 prefix: {prefix}")
+    log_workflow(f"Bucket: {args.bucket}")
+    log_workflow(f"Concurrency: {args.concurrency}")
 
     if not args.dry_run:
         r2 = get_r2_client()
     else:
         r2 = None
-        log.info("DRY RUN — fetch only, no upload")
+        log_workflow("DRY RUN — fetch only, no upload")
 
     # -------------------------------------------------------------------
     # 1. Singles catalog
@@ -198,6 +208,9 @@ def main():
         sealed_bytes = json.dumps(sealed_data).encode()
         if r2:
             upload_to_r2(r2, args.bucket, f"{prefix}/prices_sealed.json.gz", sealed_bytes)
+    else:
+        # Leave the manifest key unset when the sealed payload is missing so readers do not chase a bad path.
+        log.warning("prices/sealed fetch failed; continuing without a sealed snapshot object")
 
     # -------------------------------------------------------------------
     # 3. Full sales data (concurrent)
@@ -282,7 +295,6 @@ def main():
         "prefix": prefix,
         "files": {
             "prices_singles": f"{prefix}/prices_singles.json.gz",
-            "prices_sealed": f"{prefix}/prices_sealed.json.gz",
         },
         "stats": {
             "singles_count": len(singles_list),
@@ -295,6 +307,10 @@ def main():
             "sealed_fetch_s": round(sealed_time, 2),
         },
     }
+
+    if sealed_data:
+        # Only advertise sealed data when the object was actually fetched and uploaded.
+        manifest["files"]["prices_sealed"] = f"{prefix}/prices_sealed.json.gz"
 
     if not args.catalog_only:
         manifest["files"]["products_singles"] = f"{prefix}/products_singles.json.gz"
@@ -310,6 +326,21 @@ def main():
     if r2:
         upload_to_r2(r2, args.bucket, f"{prefix}/manifest.json.gz", manifest_bytes)
         upload_to_r2(r2, args.bucket, "latest.json.gz", manifest_bytes)
+
+        # The Parquet layer is derived from the in-memory snapshot payloads so every run stays in sync.
+        parquet_counts = write_snapshot_parquet(
+            r2,
+            args.bucket,
+            manifest,
+            manifest_payload=manifest,
+            prices_singles_payload=singles_data,
+            prices_sealed_payload=sealed_data,
+            products_singles_payload=products_payload if not args.catalog_only else None,
+        )
+        log_workflow(
+            "Wrote Parquet snapshot datasets: "
+            f"{json.dumps(parquet_counts, sort_keys=True)}"
+        )
 
     log.info("=" * 60)
     log.info("DONE")

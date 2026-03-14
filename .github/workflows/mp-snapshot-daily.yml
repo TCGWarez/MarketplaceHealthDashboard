@@ -1,4 +1,4 @@
-# Mana Pool Snapshot → R2 — daily at 11pm EST
+# Mana Pool Snapshot → R2 — daily at 1am EST
 # Runs mp-snapshot-r2.py to fetch catalog + sales and upload to Cloudflare R2.
 # Requires repo secrets: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY
 # Optional secret: R2_BUCKET (defaults to manapool-snapshots if unset)
@@ -27,7 +27,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install boto3 requests python-dotenv
+          pip install -r requirements.txt
 
       - name: Check R2 secrets are set
         env:
