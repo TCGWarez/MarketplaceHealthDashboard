@@ -7,6 +7,7 @@ import argparse
 import json
 import logging
 import os
+import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable
 
@@ -40,6 +41,29 @@ SNAPSHOT_TABLE_LAYERS = {
     "prices_sealed_rows": "bronze",
     "products_singles_cards_raw": "bronze",
     "products_singles_variants": "silver",
+}
+SALES_GROUP_ALIASES = {
+    "card": "card",
+    "cards": "card",
+    "product": "variant",
+    "products": "variant",
+    "sku": "variant",
+    "skus": "variant",
+    "variant": "variant",
+    "variants": "variant",
+}
+SALES_SORT_ALIASES = {
+    "count": "sales_count",
+    "gross": "gross_cents",
+    "gross_cents": "gross_cents",
+    "latest": "latest_sale_at",
+    "latest_sale_at": "latest_sale_at",
+    "revenue": "gross_cents",
+    "sales": "sales_count",
+    "sales_count": "sales_count",
+    "units": "units_sold",
+    "units_sold": "units_sold",
+    "volume": "units_sold",
 }
 
 
@@ -88,8 +112,8 @@ def _sql_quote(value: str) -> str:
 
 def _sql_like(value: str) -> str:
     """Quote LIKE patterns while escaping literal `%` and `_` characters."""
-    escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_").replace("'", "''")
-    return f"'%{escaped}%' ESCAPE '\\\\'"
+    escaped = value.replace("!", "!!").replace("%", "!%").replace("_", "!_").replace("'", "''")
+    return f"'%{escaped}%' ESCAPE '!'"
 
 
 def get_latest_snapshot(client, bucket: str = BUCKET) -> dict[str, Any]:
@@ -324,6 +348,59 @@ def _coerce_date(value: str | None) -> date | None:
     return datetime.strptime(value, "%Y-%m-%d").date()
 
 
+def _normalize_sales_group_by(group_by: str) -> str:
+    """Map common grouping aliases to the explicit summary grain."""
+    normalized = SALES_GROUP_ALIASES.get((group_by or "").strip().lower())
+    if normalized is None:
+        raise ValueError(f"Unsupported sales group: {group_by!r}")
+    return normalized
+
+
+def _normalize_sales_sort_by(sort_by: str) -> str:
+    """Map common sales ranking aliases to canonical metric keys."""
+    normalized = SALES_SORT_ALIASES.get((sort_by or "").strip().lower())
+    if normalized is None:
+        raise ValueError(f"Unsupported sales sort: {sort_by!r}")
+    return normalized
+
+
+def _coerce_date_value(value: str | date | None) -> date | None:
+    """Accept either `date` objects or `YYYY-MM-DD` strings for relative windows."""
+    if isinstance(value, date):
+        return value
+    return _coerce_date(value)
+
+
+def _resolve_relative_window(
+    *,
+    days: int,
+    end_date: str | date | None = None,
+    today: date | None = None,
+) -> tuple[str, str]:
+    """Turn relative-day windows into inclusive ISO start/end dates."""
+    if days < 1:
+        raise ValueError("`days` must be at least 1.")
+    resolved_end = _coerce_date_value(end_date) or today or date.today()
+    resolved_start = resolved_end - timedelta(days=days - 1)
+    return resolved_start.isoformat(), resolved_end.isoformat()
+
+
+def _sales_time_range_payload(
+    *,
+    sale_date: str | None,
+    start_date: str | None,
+    end_date: str | None,
+) -> dict[str, Any]:
+    """Emit a stable time-range description alongside sales query results."""
+    if sale_date:
+        return {"kind": "single_day", "sale_date": sale_date}
+    return {
+        "kind": "date_range",
+        "start_date": start_date,
+        "end_date": end_date,
+    }
+
+
 def scan_sales_events(
     client,
     *,
@@ -377,11 +454,14 @@ def summarize_sales_events(
     *,
     top_n: int = 20,
     group_by: str = "card",
+    sort_by: str = "units_sold",
 ) -> list[dict[str, Any]]:
     """Aggregate canonical sales rows by card or card-variant."""
+    normalized_group_by = _normalize_sales_group_by(group_by)
+    normalized_sort_by = _normalize_sales_sort_by(sort_by)
     buckets: dict[tuple[Any, ...], dict[str, Any]] = {}
     for row in sale_rows:
-        if group_by == "variant":
+        if normalized_group_by == "variant":
             key = (
                 row.get("card_name"),
                 row.get("set_code"),
@@ -396,9 +476,9 @@ def summarize_sales_events(
             buckets[key] = {
                 "card_name": row.get("card_name"),
                 "set_code": row.get("set_code"),
-                "variant_language_id": row.get("variant_language_id") if group_by == "variant" else None,
-                "variant_condition_id": row.get("variant_condition_id") if group_by == "variant" else None,
-                "variant_finish_id": row.get("variant_finish_id") if group_by == "variant" else None,
+                "variant_language_id": row.get("variant_language_id") if normalized_group_by == "variant" else None,
+                "variant_condition_id": row.get("variant_condition_id") if normalized_group_by == "variant" else None,
+                "variant_finish_id": row.get("variant_finish_id") if normalized_group_by == "variant" else None,
                 "sales_count": 0,
                 "units_sold": 0,
                 "gross_cents": 0,
@@ -412,12 +492,126 @@ def summarize_sales_events(
         if (row.get("sale_created_at") or "") > (bucket.get("latest_sale_at") or ""):
             bucket["latest_sale_at"] = row.get("sale_created_at")
 
-    results = sorted(
-        buckets.values(),
-        key=lambda item: (item["units_sold"], item["gross_cents"], item["sales_count"]),
-        reverse=True,
-    )
+    if normalized_sort_by == "gross_cents":
+        sort_key = lambda item: (item["gross_cents"], item["units_sold"], item["sales_count"])
+    elif normalized_sort_by == "sales_count":
+        sort_key = lambda item: (item["sales_count"], item["units_sold"], item["gross_cents"])
+    elif normalized_sort_by == "latest_sale_at":
+        sort_key = lambda item: (item["latest_sale_at"] or "", item["gross_cents"], item["units_sold"])
+    else:
+        sort_key = lambda item: (item["units_sold"], item["gross_cents"], item["sales_count"])
+
+    results = sorted(buckets.values(), key=sort_key, reverse=True)
     return results[:top_n]
+
+
+def _sales_query_payload(
+    sale_rows: list[dict[str, Any]],
+    *,
+    sale_date: str | None,
+    start_date: str | None,
+    end_date: str | None,
+    card_query: str | None,
+    set_code: str | None,
+    group_by: str,
+    sort_by: str,
+    top_n: int,
+) -> dict[str, Any]:
+    """Shape a sales aggregation response from already-loaded canonical sale rows."""
+    normalized_group_by = _normalize_sales_group_by(group_by)
+    normalized_sort_by = _normalize_sales_sort_by(sort_by)
+    results = summarize_sales_events(
+        sale_rows,
+        top_n=top_n,
+        group_by=normalized_group_by,
+        sort_by=normalized_sort_by,
+    )
+    return {
+        "dataset": "silver.sales_events",
+        "time_range": _sales_time_range_payload(
+            sale_date=sale_date,
+            start_date=start_date,
+            end_date=end_date,
+        ),
+        "filters": {
+            "card_query": card_query,
+            "set_code": set_code,
+        },
+        "group_by": normalized_group_by,
+        "sort_by": normalized_sort_by,
+        "sale_row_count": len(sale_rows),
+        "result_count": len(results),
+        "results": results,
+    }
+
+
+def query_sales(
+    client,
+    *,
+    sale_date: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    days: int | None = None,
+    end_on: str | date | None = None,
+    card_query: str | None = None,
+    set_code: str | None = None,
+    group_by: str = "card",
+    sort_by: str = "units_sold",
+    top_n: int = 20,
+) -> dict[str, Any]:
+    """Run a canonical sales query and return both metadata and aggregated rows."""
+    resolved_sale_date = sale_date
+    resolved_start_date = start_date
+    resolved_end_date = end_date
+
+    if days is not None:
+        if sale_date or start_date or end_date:
+            raise ValueError("Use either explicit date filters or `days`, not both.")
+        resolved_start_date, resolved_end_date = _resolve_relative_window(days=days, end_date=end_on)
+
+    sale_rows = scan_sales_events(
+        client,
+        sale_date=resolved_sale_date,
+        start_date=resolved_start_date,
+        end_date=resolved_end_date,
+        card_query=card_query,
+        set_code=set_code,
+    )
+    return _sales_query_payload(
+        sale_rows,
+        sale_date=resolved_sale_date,
+        start_date=resolved_start_date,
+        end_date=resolved_end_date,
+        card_query=card_query,
+        set_code=set_code,
+        group_by=group_by,
+        sort_by=sort_by,
+        top_n=top_n,
+    )
+
+
+def top_sellers(
+    client,
+    *,
+    days: int = 7,
+    end_date: str | date | None = None,
+    card_query: str | None = None,
+    set_code: str | None = None,
+    group_by: str = "variant",
+    sort_by: str = "units_sold",
+    top_n: int = 20,
+) -> dict[str, Any]:
+    """Convenience wrapper for the common recent top-sellers question."""
+    return query_sales(
+        client,
+        days=days,
+        end_on=end_date,
+        card_query=card_query,
+        set_code=set_code,
+        group_by=group_by,
+        sort_by=sort_by,
+        top_n=top_n,
+    )
 
 
 def _build_card_price_index(products_data: dict[str, Any], field: str) -> dict[tuple[str, str], float]:
@@ -507,6 +701,206 @@ def cents_to_dollars(value: int | float | None) -> float | None:
     return round(float(value) / 100.0, 2)
 
 
+def _extract_top_n(question: str, default: int = 20) -> int:
+    """Infer `top N` style limits from plain-English questions."""
+    match = re.search(r"\btop\s+(\d+)\b", question, flags=re.IGNORECASE)
+    if not match:
+        return default
+    return max(1, int(match.group(1)))
+
+
+def _extract_quoted_phrase(question: str) -> str | None:
+    """Use quoted phrases as high-confidence card-name filters."""
+    match = re.search(r'"([^"]+)"', question)
+    if match:
+        return match.group(1).strip()
+    match = re.search(r"'([^']+)'", question)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def _extract_name_query(question: str) -> str | None:
+    """Infer a likely card-name filter from either quoted or simple natural phrasing."""
+    quoted = _extract_quoted_phrase(question)
+    if quoted:
+        return quoted
+
+    patterns = [
+        r"\bhow many\s+(.+?)\s+sold\b",
+        r"\bis\s+(.+?)\s+in stock\b",
+        r"\bhistory(?:\s+for)?\s+(.+?)(?=\s+\b(?:on|over|past|last|by|with|in|from|between|today|yesterday|currently|now)\b|[?.!,]|$)",
+        r"\b(?:for|of|about)\s+(.+?)(?=\s+\b(?:on|over|past|last|by|with|in|from|between|today|yesterday|currently|now)\b|[?.!,]|$)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, question, flags=re.IGNORECASE)
+        if not match:
+            continue
+        candidate = match.group(1).strip(" \"'")
+        if candidate and len(candidate) >= 3:
+            return candidate
+    return None
+
+
+def _extract_time_range(question: str, *, today: date | None = None) -> dict[str, str] | None:
+    """Parse simple absolute or relative time windows from plain-English sales questions."""
+    normalized_today = today or date.today()
+    iso_dates = re.findall(r"\b\d{4}-\d{2}-\d{2}\b", question)
+    if len(iso_dates) >= 2:
+        return {"start_date": iso_dates[0], "end_date": iso_dates[1]}
+    if len(iso_dates) == 1:
+        return {"sale_date": iso_dates[0]}
+
+    relative_days = re.search(r"\b(?:past|last)\s+(\d+)\s+days?\b", question, flags=re.IGNORECASE)
+    if relative_days:
+        start_date, end_date = _resolve_relative_window(
+            days=int(relative_days.group(1)),
+            end_date=normalized_today,
+        )
+        return {"start_date": start_date, "end_date": end_date}
+
+    lower_question = question.lower()
+    if "yesterday" in lower_question:
+        target = normalized_today - timedelta(days=1)
+        return {"sale_date": target.isoformat()}
+    if "today" in lower_question:
+        return {"sale_date": normalized_today.isoformat()}
+    return None
+
+
+def _infer_sales_group_by(question: str) -> str:
+    """Pick a sales grouping grain from simple phrasing cues."""
+    lower_question = question.lower()
+    if "variant" in lower_question or "sku" in lower_question or "product" in lower_question:
+        return "variant"
+    if "card" in lower_question:
+        return "card"
+    return "variant"
+
+
+def _infer_sales_sort_keys(question: str) -> list[str]:
+    """Pick one or more ranking metrics from common sales wording."""
+    lower_question = question.lower()
+    wants_volume = any(term in lower_question for term in ("volume", "units sold", "most sold"))
+    wants_revenue = any(term in lower_question for term in ("revenue", "gross", "sales dollars"))
+    if wants_volume and wants_revenue:
+        return ["units_sold", "gross_cents"]
+    if wants_revenue:
+        return ["gross_cents"]
+    return ["units_sold"]
+
+
+def _classify_question(question: str) -> str:
+    """Route plain-English questions onto one of the supported data domains."""
+    lower_question = question.lower()
+    if any(term in lower_question for term in ("sold", "selling", "top seller", "best seller", "revenue", "units sold")):
+        return "sales"
+    if any(term in lower_question for term in ("available now", "in stock", "inventory", "copies available", "versions of")):
+        return "inventory"
+    if any(term in lower_question for term in ("price change", "price changes", "what changed", "history")):
+        return "snapshot"
+    if any(term in lower_question for term in ("schema", "payload", "source data", "original api response")):
+        return "source"
+    raise ValueError("Could not determine which dataset to use for that question.")
+
+
+def answer_question(
+    question: str,
+    *,
+    client=None,
+    today: date | None = None,
+) -> dict[str, Any]:
+    """Map common plain-English dataset questions onto explicit helper calls."""
+    domain = _classify_question(question)
+    active_client = client or get_r2_client()
+    lower_question = question.lower()
+
+    if domain == "sales":
+        time_range = _extract_time_range(question, today=today)
+        if time_range is None:
+            start_date, end_date = _resolve_relative_window(days=7, end_date=today or date.today())
+            time_range = {"start_date": start_date, "end_date": end_date}
+        top_n = _extract_top_n(question)
+        group_by = _infer_sales_group_by(question)
+        sort_keys = _infer_sales_sort_keys(question)
+        card_query = _extract_name_query(question)
+        sale_rows = scan_sales_events(
+            active_client,
+            sale_date=time_range.get("sale_date"),
+            start_date=time_range.get("start_date"),
+            end_date=time_range.get("end_date"),
+            card_query=card_query,
+        )
+        rankings = []
+        for sort_key in sort_keys:
+            rankings.append(
+                _sales_query_payload(
+                    sale_rows,
+                    sale_date=time_range.get("sale_date"),
+                    start_date=time_range.get("start_date"),
+                    end_date=time_range.get("end_date"),
+                    card_query=card_query,
+                    set_code=None,
+                    group_by=group_by,
+                    sort_by=sort_key,
+                    top_n=top_n,
+                )
+            )
+        return {
+            "question": question,
+            "domain": "sales",
+            "dataset": "silver.sales_events",
+            "rankings": rankings,
+            "assumptions": [
+                "Historical answers come from canonical silver.sales_events.",
+                "If no explicit date is provided, the default window is the last 7 days ending today.",
+            ],
+        }
+
+    if domain == "inventory":
+        variant_rows = load_latest_variant_snapshot(active_client)
+        results = filter_variant_rows(
+            variant_rows,
+            name_query=_extract_name_query(question),
+            require_sales="with sales" in lower_question,
+            limit=_extract_top_n(question),
+        )
+        latest = get_latest_snapshot(active_client)
+        return {
+            "question": question,
+            "domain": "inventory",
+            "dataset": "silver.products_singles_variants",
+            "snapshot_ts": latest["snapshot_ts"],
+            "result_count": len(results),
+            "results": results,
+        }
+
+    if domain == "snapshot":
+        if "history" in lower_question:
+            card_query = _extract_name_query(question)
+            if not card_query:
+                raise ValueError("Snapshot history questions should quote the card name.")
+            return {
+                "question": question,
+                "domain": "snapshot",
+                "dataset": "raw snapshots + snapshot-partitioned Parquet",
+                "results": get_card_history(active_client, card_query, snapshot_limit=_extract_top_n(question, default=10)),
+            }
+        return {
+            "question": question,
+            "domain": "snapshot",
+            "dataset": "raw snapshots",
+            "results": get_price_changes(active_client, limit=_extract_top_n(question, default=20)),
+        }
+
+    return {
+        "question": question,
+        "domain": "source",
+        "dataset": "raw snapshots",
+        "results": describe_snapshot_schema(active_client),
+    }
+
+
 def _pretty_print(payload: Any) -> None:
     """Print stable JSON for CLI inspection."""
     print(json.dumps(payload, indent=2, default=str))
@@ -556,7 +950,20 @@ def build_cli() -> argparse.ArgumentParser:
     sales_summary_parser.add_argument("--card-query", type=str, default=None)
     sales_summary_parser.add_argument("--set-code", type=str, default=None)
     sales_summary_parser.add_argument("--group-by", choices=["card", "variant"], default="card")
+    sales_summary_parser.add_argument("--sort-by", choices=["units_sold", "gross_cents", "sales_count", "latest_sale_at"], default="units_sold")
     sales_summary_parser.add_argument("--top", type=int, default=20)
+
+    top_sellers_parser = subparsers.add_parser("top-sellers", help="Show top sellers over a recent relative window")
+    top_sellers_parser.add_argument("--days", type=int, default=7)
+    top_sellers_parser.add_argument("--end-date", type=str, default=None)
+    top_sellers_parser.add_argument("--card-query", type=str, default=None)
+    top_sellers_parser.add_argument("--set-code", type=str, default=None)
+    top_sellers_parser.add_argument("--group-by", choices=["card", "variant"], default="variant")
+    top_sellers_parser.add_argument("--sort-by", choices=["units_sold", "gross_cents", "sales_count", "latest_sale_at"], default="units_sold")
+    top_sellers_parser.add_argument("--top", type=int, default=20)
+
+    answer_parser = subparsers.add_parser("answer", help="Route a plain-English question onto the query helpers")
+    answer_parser.add_argument("question", type=str)
 
     price_changes_parser = subparsers.add_parser("price-changes", help="Compare the latest two raw snapshots")
     price_changes_parser.add_argument("--limit", type=int, default=20)
@@ -626,15 +1033,38 @@ def main() -> None:
         return
 
     if args.command == "sales-summary":
-        sale_rows = scan_sales_events(
-            client,
-            sale_date=args.sale_date,
-            start_date=args.start_date,
-            end_date=args.end_date,
-            card_query=args.card_query,
-            set_code=args.set_code,
+        _pretty_print(
+            query_sales(
+                client,
+                sale_date=args.sale_date,
+                start_date=args.start_date,
+                end_date=args.end_date,
+                card_query=args.card_query,
+                set_code=args.set_code,
+                group_by=args.group_by,
+                sort_by=args.sort_by,
+                top_n=args.top,
+            )
         )
-        _pretty_print(summarize_sales_events(sale_rows, top_n=args.top, group_by=args.group_by))
+        return
+
+    if args.command == "top-sellers":
+        _pretty_print(
+            top_sellers(
+                client,
+                days=args.days,
+                end_date=args.end_date,
+                card_query=args.card_query,
+                set_code=args.set_code,
+                group_by=args.group_by,
+                sort_by=args.sort_by,
+                top_n=args.top,
+            )
+        )
+        return
+
+    if args.command == "answer":
+        _pretty_print(answer_question(args.question, client=client))
         return
 
     if args.command == "price-changes":

@@ -57,7 +57,9 @@ Important data rules:
 
 ## Query Recipes
 
-Use these rules instead of relying on natural-language routing helpers.
+Use these rules to ground dataset choice. For common plain-English questions, prefer
+`answer_question(...)`, which routes onto these explicit helpers rather than inventing
+new aggregation logic inline.
 
 ### Current Inventory
 
@@ -67,6 +69,7 @@ Use the latest `silver.products_singles_variants` partition when the user asks:
 - which versions of a card currently exist
 
 Preferred helpers in `mp_r2_agent.py`:
+- `answer_question(question, client=...)`
 - `get_latest_snapshot(client)`
 - `load_latest_variant_snapshot(client)`
 - `filter_variant_rows(...)`
@@ -80,10 +83,17 @@ Use `silver.sales_events` when the user asks:
 - best-selling cards on a day like `2026-03-13`
 
 Preferred helpers:
+- `answer_question(question, client=...)`
+- `query_sales(client, start_date=..., end_date=..., group_by=..., sort_by=...)`
+- `top_sellers(client, days=..., group_by=..., sort_by=...)`
 - `scan_sales_events(client, sale_date=..., start_date=..., end_date=...)`
 - `summarize_sales_events(...)`
 
 `scan_sales_events(...)` is backed by DuckDB over Parquet rather than sequential object reads.
+
+When the user asks for rankings such as "top selling products over the past 7 days by
+volume and by revenue", prefer `answer_question(...)` or `top_sellers(...)` rather than
+writing a custom aggregation script in the turn.
 
 Never answer historical sales questions from only the latest `products_singles` snapshot.
 
@@ -95,6 +105,7 @@ Use raw snapshot files or snapshot-partitioned Parquet tables when the user asks
 - how inventory or pricing moved by snapshot timestamp
 
 Preferred helpers:
+- `answer_question(question, client=...)`
 - `list_snapshots(client, limit=...)`
 - `load_snapshot_data(client, prefix, dataset)`
 - `load_snapshot_table_rows(client, table_name, manifest)`
@@ -109,6 +120,7 @@ Use raw JSON or bronze mirrors when the user asks:
 - how a specific field was represented in the original API response
 
 Preferred helpers:
+- `answer_question(question, client=...)`
 - `load_snapshot_data(...)`
 - `describe_snapshot_schema(...)`
 - `load_snapshot_table_rows(client, "products_singles_cards_raw", manifest)`
@@ -117,6 +129,7 @@ Preferred helpers:
 
 `mp_r2_agent.py` exposes these main entry points:
 
+- `answer_question(question, client=None, today=None)`
 - `get_r2_client()`
 - `get_latest_snapshot(client)`
 - `list_snapshots(client, limit=10)`
@@ -130,7 +143,9 @@ Preferred helpers:
 - `load_snapshot_table_rows(client, table_name, manifest)`
 - `load_latest_variant_snapshot(client)`
 - `scan_sales_events(client, sale_date=None, start_date=None, end_date=None, ...)`
-- `summarize_sales_events(sale_rows, top_n=20, group_by="card")`
+- `summarize_sales_events(sale_rows, top_n=20, group_by="card", sort_by="units_sold")`
+- `query_sales(client, sale_date=None, start_date=None, end_date=None, ..., group_by="card", sort_by="units_sold")`
+- `top_sellers(client, days=7, group_by="variant", sort_by="units_sold")`
 - `get_price_changes(client, limit=20, field="price_cents")`
 - `get_card_history(client, card_query, snapshot_limit=10)`
 - `cents_to_dollars(value)`
@@ -149,7 +164,8 @@ Use `mp_r2_agent.py` to answer the user's question from live R2 snapshot data.
 
 Rules:
 - Start by creating a client with `get_r2_client()`.
-- Choose the dataset based on the question type.
+- Prefer `answer_question(...)` first for plain-English questions. If it cannot express the
+  question cleanly, fall back to the explicit helpers below.
 - For current inventory, use the latest `silver.products_singles_variants` partition.
 - For historical sales, use canonical `silver.sales_events`.
 - For snapshot comparisons, use raw snapshots or snapshot-partitioned Parquet tables.
@@ -184,6 +200,15 @@ python mp_r2_agent.py sales-events --sale-date 2026-03-13 --card-query "Lightnin
 
 # Summarize canonical sales over a date range
 python mp_r2_agent.py sales-summary --start-date 2026-03-13 --end-date 2026-03-14 --top 20
+
+# Summarize canonical sales over a date range by revenue
+python mp_r2_agent.py sales-summary --start-date 2026-03-13 --end-date 2026-03-14 --group-by variant --sort-by gross_cents --top 20
+
+# Show recent top sellers over a relative window
+python mp_r2_agent.py top-sellers --days 7 --group-by variant --sort-by units_sold --top 10
+
+# Route a plain-English question onto the explicit query helpers
+python mp_r2_agent.py answer "What were the top selling products over the past 7 days by revenue?"
 
 # Compare latest two raw snapshots
 python mp_r2_agent.py price-changes --limit 20
